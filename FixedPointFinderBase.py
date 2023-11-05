@@ -16,70 +16,39 @@ Please direct correspondence to mgolub@cs.washington.edu
 
 import numpy as np
 import time
+import ivy
 from copy import deepcopy
+from typing import Union, Optional, Literal
 
 from FixedPoints import FixedPoints
+from .ivy_utils import ReduceLROnPlateau, AdaptiveLearningRate, AdaptiveGradNormClip
 
-class FixedPointFinderBase(object):
+class FixedPointFinder(object):
 
-    _default_hps = {
-        'tol_q': 1e-12,
-        'tol_dq': 1e-20,
-        'max_iters': 5000,
-        'method': 'joint',
-        'do_rerun_q_outliers': False,
-        'outlier_q_scale': 10.0,
-        'do_exclude_distance_outliers': True,
-        'outlier_distance_scale': 10.0,
-        'tol_unique': 1e-3,
-        'max_n_unique': np.inf,
-        'do_compute_jacobians': True,
-        'do_decompose_jacobians': True,
-        'dtype': 'float32',
-        'random_seed': 0,
-        'verbose': True,
-        'super_verbose': False,
-        'n_iters_per_print_update': 100,
-        }
-
-    @classmethod
-    def default_hps(cls):
-        ''' Returns a deep copy of the default hyperparameters dict.
-
-        The deep copy protects against external updates to the defaults, which
-        in turn protects against unintended interactions with the hashing done
-        by the Hyperparameters class.
-
-        Args:
-            None.
-
-        Returns:
-            dict of hyperparameters.
-
-
-        '''
-        return deepcopy(cls._default_hps)
-
-    def __init__(self, rnn_cell,
-        tol_q=_default_hps['tol_q'],
-        tol_dq=_default_hps['tol_dq'],
-        max_iters=_default_hps['max_iters'],
-        method=_default_hps['method'],
-        do_rerun_q_outliers=_default_hps['do_rerun_q_outliers'],
-        outlier_q_scale=_default_hps['outlier_q_scale'],
-        do_exclude_distance_outliers=\
-            _default_hps['do_exclude_distance_outliers'],
-        outlier_distance_scale=_default_hps['outlier_distance_scale'],
-        tol_unique=_default_hps['tol_unique'],
-        max_n_unique=_default_hps['max_n_unique'],
-        do_compute_jacobians=_default_hps['do_compute_jacobians'],
-        do_decompose_jacobians=_default_hps['do_decompose_jacobians'],
-        dtype=_default_hps['dtype'],
-        random_seed=_default_hps['random_seed'],
-        verbose=_default_hps['verbose'],
-        super_verbose=_default_hps['super_verbose'],
-        n_iters_per_print_update=_default_hps['n_iters_per_print_update']):
-        '''Creates a FixedPointFinder object.
+    def __init__(self, 
+        rnn_cell,
+        lr_init: float = 1e-2,
+        tol_q: float = 1e-12,
+        tol_dq: float = 1e-20,
+        max_iters: int = 5000,
+        method: Literal["grad_joint", "grad_sequential", "swarm"] = "grad_joint",
+        do_rerun_q_outliers: bool = False,
+        outlier_q_scale: float = 10.0,
+        do_exclude_distance_outliers: bool = True,
+        outlier_distance_scale: float = 10.0,
+        tol_unique: float = 1e-3,
+        max_n_unique: Optional[int] = None,
+        do_compute_jacobians: bool = True,
+        do_decompose_jacobians: bool = True,
+        lr_scheduler: Optional[Literal["plateau", "adaptive"]] = None,
+        lr_scheduler_params: Optional[dict] = None,
+        grad_clip_params: Optional[dict] = None,
+        dtype: Union[str, type, np.dtype] = "float32",
+        random_seed: int = 0,
+        verbosity: int = 1,
+        n_iters_per_print_update: int = 100,
+    ):
+        """Creates a FixedPointFinder object.
 
         Optimization terminates once every initialization satisfies one or
         both of the following criteria:
@@ -166,19 +135,20 @@ class FixedPointFinderBase(object):
             n_iters_per_print_update (optional): An int specifying how often
             to print updates during the fixed point optimizations. Default:
             100.
-        '''
+        """
 
         self.dtype = dtype
         self.np_dtype = np.dtype(dtype)
 
         # Make random sequences reproducible
         self.random_seed = random_seed
-        self.rng = np.random.RandomState(random_seed)
+        self.rng = np.random.Generator(random_seed)
 
         # *********************************************************************
         # Optimization hyperparameters ****************************************
         # *********************************************************************
 
+        self.lr_init = lr_init
         self.tol_q = tol_q
         self.tol_dq = tol_dq
         self.method = method
@@ -191,17 +161,24 @@ class FixedPointFinderBase(object):
         self.max_n_unique = max_n_unique
         self.do_compute_jacobians = do_compute_jacobians
         self.do_decompose_jacobians = do_decompose_jacobians
-        self.verbose = verbose
-        self.super_verbose = super_verbose
+        self.lr_scheduler = lr_scheduler
+        self.lr_scheduler_params = lr_scheduler_params
+        self.grad_clip_params = grad_clip_params
+        self.verbosity = verbosity
         self.n_iters_per_print_update = n_iters_per_print_update
 
     # *************************************************************************
     # Primary exposed functions ***********************************************
     # *************************************************************************
 
-    def sample_inputs_and_states(self, inputs, state_traj, n_inits,
-        valid_bxt=None,
-        noise_scale=0.0):
+    def sample_inputs_and_states(
+        self, 
+        n_samples: int,
+        state_traj: np.ndarray, # maybe one day, make it ivy
+        inputs: Optional[np.ndarray] = None, 
+        valid_mask: Optional[np.ndarray] = None,
+        noise_scale: float = 0.0,
+    ):
         '''Draws random paired samples from the RNN's inputs and hidden-state
         trajectories. Sampled states (but not inputs) can optionally be
         corrupted by independent and identically distributed (IID) Gaussian
@@ -236,86 +213,30 @@ class FixedPointFinderBase(object):
         Raises:
             ValueError if noise_scale is negative.
         '''
-        [n_batch, n_time, n_states] = state_traj_bxtxd.shape
-        n_inputs = inputs.shape[2]
+        n_batch, n_time, _ = state_traj.shape
 
-        valid_bxt = self._get_valid_mask(n_batch, n_time, valid_bxt=valid_bxt)
+        valid_mask = self._get_valid_mask(n_batch, n_time, valid_mask=valid_mask)
         trial_indices, time_indices = \
-            self._sample_trial_and_time_indices(valid_bxt, n_inits)
+            self._sample_trial_and_time_indices(valid_mask, n_samples)
 
-        # Draw random samples from inputs and state trajectories
-        input_samples = np.zeros([n_inits, n_inputs])
-        state_samples = np.zeros([n_inits, n_states])
-        for init_idx in range(n_inits):
-            trial_idx = trial_indices[init_idx]
-            time_idx = time_indices[init_idx]
-            input_samples[init_idx,:] = inputs[trial_idx,time_idx,:]
-            state_samples[init_idx,:] = state_traj_bxtxd[trial_idx,time_idx,:]
-
+        # Draw random samples from state trajectories
+        state_samples = state_traj[trial_indices][:,time_indices].copy()
         # Add IID Gaussian noise to the sampled states
         state_samples = self._add_gaussian_noise(
             state_samples, noise_scale)
-
         assert not np.any(np.isnan(state_samples)),\
             'Detected NaNs in sampled states. Check state_traj and valid_bxt.'
+    
+        if inputs is not None:
+            # Draw corresponding samples from inputs
+            input_samples = inputs[trial_indices][:,time_indices].copy()
+            assert not np.any(np.isnan(input_samples)),\
+                'Detected NaNs in sampled inputs. Check inputs and valid_bxt.'
 
-        assert not np.any(np.isnan(input_samples)),\
-            'Detected NaNs in sampled inputs. Check inputs and valid_bxt.'
+            return state_samples, input_samples 
 
-        return input_samples, state_samples
-
-    def sample_states(self, state_traj, n_inits,
-        valid_bxt=None,
-        noise_scale=0.0):
-        '''Draws random samples from trajectories of the RNN state. Samples
-        can optionally be corrupted by independent and identically distributed
-        (IID) Gaussian noise. These samples are intended to be used as initial
-        states for fixed point optimizations.
-
-        Args:
-            state_traj: [n_batch x n_time x n_states] numpy array containing
-            example trajectories of the RNN state.
-
-            n_inits: int specifying the number of sampled states to return.
-
-            valid_bxt (optional): [n_batch x n_time] boolean mask indicated
-            the set of trials and timesteps from which to sample. Default: all
-            trials and timesteps are assumed valid.
-
-            noise_scale (optional): non-negative float specifying the standard
-            deviation of IID Gaussian noise samples added to the sampled
-            states.
-
-        Returns:
-            initial_states: Sampled RNN states as a [n_inits x n_states] numpy
-            array.
-
-        Raises:
-            ValueError if noise_scale is negative.
-        '''
-
-        state_traj_bxtxd = state_traj
-
-        [n_batch, n_time, n_states] = state_traj_bxtxd.shape
-
-        valid_bxt = self._get_valid_mask(n_batch, n_time, valid_bxt=valid_bxt)
-        trial_indices, time_indices = self._sample_trial_and_time_indices(
-            valid_bxt, n_inits)
-
-        # Draw random samples from state trajectories
-        states = np.zeros([n_inits, n_states])
-        for init_idx in range(n_inits):
-            trial_idx = trial_indices[init_idx]
-            time_idx = time_indices[init_idx]
-            states[init_idx,:] = state_traj_bxtxd[trial_idx, time_idx]
-
-        # Add IID Gaussian noise to the sampled states
-        states = self._add_gaussian_noise(states, noise_scale)
-
-        assert not np.any(np.isnan(states)),\
-            'Detected NaNs in sampled states. Check state_traj and valid_bxt.'
-
-        return states
+        # else
+        return state_samples
 
     def find_fixed_points(self, initial_states, inputs, cond_ids=None):
         '''Finds RNN fixed points and the Jacobians at the fixed points.
@@ -363,6 +284,8 @@ class FixedPointFinderBase(object):
         elif self.method == 'joint':
             all_fps = self._run_joint_optimization(
                 initial_states, inputs_nxd, cond_ids=cond_ids)
+        elif self.method == 'swarm':
+            all_fps = self._run_swarm_optimization()
         else:
             raise ValueError('Unsupported optimization method. Must be either \
                 \'joint\' or \'sequential\', but was  \'%s\'' % self.method)
@@ -432,7 +355,7 @@ class FixedPointFinderBase(object):
     # API functions, implemented by Pytorch and TF subclasses *****************
     # *************************************************************************
 
-    def _run_joint_optimization(self, initial_states, inputs, cond_ids=None):
+    def _run_gradient_optimization(self, initial_states, inputs, cond_ids=None):
         '''Finds multiple fixed points via a joint optimization over multiple
         state vectors.
 
@@ -448,8 +371,102 @@ class FixedPointFinderBase(object):
             fps: A FixedPoints object containing the optimized fixed points
             and associated metadata.
         '''
+        optimizer = ivy.stateful.optimizers.Adam(lr=self.lr_init)
+        if self.lr_scheduler == "plateau":
+            scheduler = ReduceLROnPlateau(**(self.lr_scheduler_params or dict()))
+            scheduler.initialize(optimizer)
+        elif self.lr_scheduler == "adaptive":
+            scheduler = AdaptiveLearningRate(**(self.lr_scheduler_params or dict()))
+            scheduler.initialize(optimizer)
+        else:
+            scheduler = None
 
-        raise NotImplementedError
+        n_batch = inputs.shape[0]
+        TIME_DIM = self._time_dim
+        x = initial_states
+
+        # self._print_if_verbose('\tFinding fixed points via gradient optimization.')
+
+        iter_count = 0
+        t_start = time.time()
+        q_prev_b = ivy.full((n_batch,), float('nan'), device=self.device)
+
+        call_rnn = ivy.trace_graph(self.rnn_cell)
+
+        def eval_q(states):
+            prev_state, next_state = call_rnn(inputs, states)
+            q = ivy.mean(ivy.square(ivy.subtract(next_state, prev_state)), dim=-1)
+            return q
+
+        while True:
+            
+            q_b, grad = ivy.execute_with_gradients(eval_q, x)
+
+            q_scalar = ivy.mean(q_b)
+            dq_b = ivy.abs(q_b - q_prev_b)
+            
+            optimizer.step(x, grad)
+            scheduler.step(optimizer, metrics=q_scalar)
+
+            iter_learning_rate = scheduler._last_lr[0]
+
+            ev_q_scalar = q_scalar.detach().cpu().numpy()
+            ev_q_b = q_b.detach().cpu().numpy()
+            ev_dq_b = dq_b.detach().cpu().numpy()
+
+            if self.super_verbose and \
+                np.mod(iter_count, self.n_iters_per_print_update)==0:
+                self._print_iter_update(
+                    iter_count, t_start, ev_q_b, ev_dq_b, iter_learning_rate)
+
+            if iter_count > 1 and \
+                np.all(np.logical_or(
+                    ev_dq_b < self.tol_dq*iter_learning_rate,
+                    ev_q_b < self.tol_q)):
+                '''Here dq is scaled by the learning rate. Otherwise very
+                small steps due to very small learning rates would spuriously
+                indicate convergence. This scaling is roughly equivalent to
+                measuring the gradient norm.'''
+                self._print_if_verbose('\tOptimization complete '
+                                       'to desired tolerance.')
+                break
+
+            if iter_count + 1 > self.max_iters:
+                self._print_if_verbose('\tMaximum iteration count reached. '
+                                       'Terminating.')
+                break
+
+            q_prev_b = q_b
+            iter_count += 1
+
+        if self.verbose:
+            self._print_iter_update(
+                iter_count, t_start, ev_q_b, ev_dq_b, iter_learning_rate, 
+                is_final=True)
+
+        # remove extra dims
+        xstar = x_1xbxd.squeeze(0)
+        xstar = xstar.detach().cpu().numpy()
+        
+        F_xstar = F_x_1xbxd.squeeze(0)
+        F_xstar = F_xstar.detach().cpu().numpy()
+
+        # Indicate same n_iters for each initialization (i.e., joint optimization)        
+        n_iters = np.tile(iter_count, reps=F_xstar.shape[0])
+
+        fps = FixedPoints(
+            xstar=xstar,
+            x_init=initial_states,
+            inputs=inputs,
+            cond_id=cond_ids,
+            F_xstar=F_xstar,
+            qstar=ev_q_b,
+            dq=ev_dq_b,
+            n_iters=n_iters,
+            tol_unique=self.tol_unique,
+            dtype=self.np_dtype)
+
+        return fps 
 
     def _run_single_optimization(self, initial_state, inputs, cond_id=None):
         '''Finds a single fixed point from a single initial state.
@@ -569,7 +586,7 @@ class FixedPointFinderBase(object):
 
         return fps
 
-    def _sample_trial_and_time_indices(self, valid_bxt, n):
+    def _sample_trial_and_time_indices(self, valid_mask, n_samples):
         ''' Generate n random indices corresponding to True entries in
         valid_bxt. Sampling is performed without replacement.
 
@@ -584,14 +601,14 @@ class FixedPointFinderBase(object):
             (i=trial_indices[k], j=time_indices[k])
         '''
 
-        (trial_idx, time_idx) = np.nonzero(valid_bxt)
+        (trial_idx, time_idx) = np.nonzero(valid_mask)
         max_sample_index = len(trial_idx) # same as len(time_idx)
-        sample_indices = self.rng.randint(max_sample_index, size=n)
+        sample_indices = self.rng.randint(max_sample_index, size=n_samples)
 
         return trial_idx[sample_indices], time_idx[sample_indices]
 
     @staticmethod
-    def _get_valid_mask(n_batch, n_time, valid_bxt=None):
+    def _get_valid_mask(n_batch, n_time, valid_mask=None):
         ''' Returns an appropriately sized boolean mask.
 
         Args:
@@ -606,19 +623,19 @@ class FixedPointFinderBase(object):
             AssertionError if valid_bxt does not have shape (n_batch, n_time)
         '''
 
-        if valid_bxt is None:
-            valid_bxt = np.ones((n_batch, n_time), dtype=bool)
+        if valid_mask is None:
+            valid_mask = np.ones((n_batch, n_time), dtype=bool)
         else:
 
-            assert (valid_bxt.shape[0] == n_batch and
-                valid_bxt.shape[1] == n_time),\
+            assert (valid_mask.shape[0] == n_batch and
+                valid_mask.shape[1] == n_time),\
                 ('valid_bxt.shape should be %s, but is %s'
-                 % ((n_batch, n_time), valid_bxt.shape))
+                 % ((n_batch, n_time), valid_mask.shape))
 
-            if not valid_bxt.dtype == bool:
-                valid_bxt = valid_bxt.astype(bool)
+            if not valid_mask.dtype == bool:
+                valid_mask = valid_mask.astype(bool)
 
-        return valid_bxt
+        return valid_mask
 
     def _add_gaussian_noise(self, data, noise_scale=0.0):
         ''' Adds IID Gaussian noise to Numpy data.
